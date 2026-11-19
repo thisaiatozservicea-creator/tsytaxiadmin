@@ -258,6 +258,7 @@ const refreshBtn = document.getElementById("refreshBtn");
 
 let allBookings = [];
 let allPartners = [];
+let addressCache = {}; // Cache addresses by "lat,lon"
 
 // Toggle section visibility
 window.toggleSection = function(sectionName, event) {
@@ -359,11 +360,33 @@ function renderBookings() {
           <button class="btn-reject btn-cancel-booking" onclick="cancelBooking('${booking.id}', '${booking.bookingId}')">✗ CANCEL</button>
           <button class="btn-confirm" onclick="openAssignModal('${booking.id}', ${JSON.stringify(booking).replace(/"/g, '&quot;')})">👤 ASSIGN PARTNER</button>
         </div>
-      ` : booking.status === 'ASSIGNED' ? `
-        <div style="background:#fff3e0;border:2px solid #ff9800;border-radius:8px;padding:12px;margin-top:12px;text-align:center">
-          <div style="font-size:12px;color:#ff9800;font-weight:900">⏳ Waiting for partner to accept...</div>
-        </div>
-      ` : booking.status === 'ACCEPTED' ? `
+      ` : booking.status === 'ASSIGNED' ? (() => {
+        const assignedTime = new Date(booking.assignedAt);
+        const now = new Date();
+        const secondsElapsed = (now - assignedTime) / 1000;
+        const secondsRemaining = Math.max(0, 90 - secondsElapsed);
+
+        if (secondsRemaining > 0) {
+          const mins = Math.floor(secondsRemaining / 60);
+          const secs = Math.floor(secondsRemaining % 60);
+          return `
+            <div style="background:#fff3e0;border:2px solid #ff9800;border-radius:8px;padding:12px;margin-top:12px;text-align:center">
+              <div style="font-size:12px;color:#ff9800;font-weight:900">⏳ Waiting for partner to accept...</div>
+              <div style="font-size:11px;color:#666;margin-top:4px">Timeout in ${mins}m ${secs}s</div>
+            </div>
+          `;
+        } else {
+          return `
+            <div style="background:#ffebee;border:2px solid var(--red);border-radius:8px;padding:12px;margin-top:12px">
+              <div style="font-size:12px;color:var(--red);font-weight:900;margin-bottom:12px">⚠️ Partner has not responded</div>
+              <div class="booking-actions">
+                <button class="btn-reject btn-cancel-booking" onclick="cancelBooking('${booking.id}', '${booking.bookingId}')">✗ CANCEL</button>
+                <button class="btn-confirm" onclick="openAssignModal('${booking.id}', ${JSON.stringify(booking).replace(/"/g, '&quot;')})">🔄 REASSIGN</button>
+              </div>
+            </div>
+          `;
+        }
+      })() : booking.status === 'ACCEPTED' ? `
         <div style="background:#e8f5e9;border:2px solid var(--green);border-radius:8px;padding:12px;margin-top:12px;text-align:center">
           <div style="font-size:12px;color:var(--green);font-weight:900">✅ Partner accepted - Trip starting soon</div>
         </div>
@@ -398,8 +421,50 @@ function updateStats() {
   statTotal.textContent = allBookings.length;
 }
 
+// Reverse geocode coordinates to address
+async function getAddressFromCoords(lat, lon) {
+  // Round to 4 decimal places (~11m accuracy) for cache key
+  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+
+  // Return cached address if available
+  if (addressCache[cacheKey]) {
+    return addressCache[cacheKey];
+  }
+
+  try {
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`,
+      {
+        headers: {
+          'User-Agent': 'TSY-TAXI-Admin'
+        }
+      }
+    );
+    const data = await response.json();
+
+    if (data && data.display_name) {
+      // Format: area, city, state
+      const addr = data.address || {};
+      const parts = [
+        addr.road || addr.suburb || addr.neighbourhood,
+        addr.city || addr.town || addr.village,
+        addr.state
+      ].filter(Boolean);
+      const address = parts.join(', ') || data.display_name;
+
+      // Cache the result
+      addressCache[cacheKey] = address;
+      return address;
+    }
+    return null;
+  } catch (error) {
+    console.error('Geocode error:', error);
+    return null;
+  }
+}
+
 // Render partners
-function renderPartners() {
+async function renderPartners() {
   const onlinePartners = allPartners.filter(p => p.isOnline && p.active !== false);
   onlineCount.textContent = onlinePartners.length;
   document.getElementById('totalPartners').textContent = allPartners.length;
@@ -409,6 +474,21 @@ function renderPartners() {
     return;
   }
 
+  // Fetch addresses for partners with location (in parallel)
+  const addressPromises = onlinePartners
+    .filter(p => p.currentLocation)
+    .map(async p => {
+      const address = await getAddressFromCoords(
+        p.currentLocation.latitude,
+        p.currentLocation.longitude
+      );
+      if (address) {
+        p.locationAddress = address;
+      }
+    });
+
+  await Promise.all(addressPromises);
+
   partnersList.innerHTML = onlinePartners.map(p => {
     const onlineMinutes = p.onlineStartTime
       ? Math.floor((Date.now() - p.onlineStartTime) / 60000)
@@ -417,11 +497,16 @@ function renderPartners() {
     const mins = onlineMinutes % 60;
     const duration = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
 
+    const isOnTrip = p.hasActiveBooking === true;
+    const statusBadge = isOnTrip
+      ? `<div class="online-badge" style="background:#fff3e0;color:#ff9800">🚗 ON TRIP</div>`
+      : `<div class="online-badge">● ONLINE ${duration}</div>`;
+
     return `
-    <div class="partner-card">
+    <div class="partner-card" style="${isOnTrip ? 'background:#fff8e1;border-color:#ffc400' : ''}">
       <div class="partner-header">
         <div class="partner-name">${p.name || "Partner"}</div>
-        <div class="online-badge">● ONLINE ${duration}</div>
+        ${statusBadge}
       </div>
       <div class="partner-details">
         <div class="partner-detail">
@@ -449,8 +534,8 @@ function renderPartners() {
         ${p.currentLocation ? `<div class="partner-detail" style="grid-column:1/-1">
           <div class="partner-label">📍 Current Location</div>
           <div class="partner-value" style="font-size:11px;line-height:1.4">
-            ${p.currentLocation.latitude.toFixed(6)}, ${p.currentLocation.longitude.toFixed(6)}
-            <br><small style="color:#888">Accuracy: ±${Math.round(p.currentLocation.accuracy)}m</small>
+            ${p.locationAddress || 'Loading address...'}
+            <br><small style="color:#888">${p.currentLocation.latitude.toFixed(6)}, ${p.currentLocation.longitude.toFixed(6)} • ±${Math.round(p.currentLocation.accuracy)}m</small>
           </div>
         </div>` : ''}
       </div>
@@ -509,12 +594,12 @@ onSnapshot(q, async (snapshot) => {
 const partnersRef = collection(partnersDb, "partners");
 const partnersQuery = query(partnersRef);
 
-onSnapshot(partnersQuery, (snapshot) => {
+onSnapshot(partnersQuery, async (snapshot) => {
   allPartners = [];
   snapshot.forEach((doc) => {
     allPartners.push({ id: doc.id, ...doc.data() });
   });
-  renderPartners();
+  await renderPartners();
 
   // Set max-height for smooth collapse
   const partnersList = document.getElementById('partnersList');
@@ -629,11 +714,16 @@ window.openAssignModal = function(bookingId, bookingData) {
   modal.classList.add("show");
   modalList.innerHTML = '<div class="loading">Loading online partners...</div>';
 
-  // Get online partners and calculate distances
-  const onlinePartners = allPartners.filter(p => p.isOnline && p.active && p.currentLocation);
+  // Get online partners and calculate distances (exclude partners already on a trip)
+  const onlinePartners = allPartners.filter(p =>
+    p.isOnline &&
+    p.active &&
+    p.currentLocation &&
+    !p.hasActiveBooking
+  );
 
   if (onlinePartners.length === 0) {
-    modalList.innerHTML = '<div class="empty-state">No partners online currently.</div>';
+    modalList.innerHTML = '<div class="empty-state">No available partners online. All partners are either offline or currently on a trip.</div>';
     return;
   }
 
@@ -684,12 +774,28 @@ window.openAssignModal = function(bookingId, bookingData) {
 };
 
 // Assign partner to booking
-window.assignPartnerToBooking = async function(partnerId, partnerData) {
+window.assignPartnerToBooking = async function(partnerDocId, partnerData) {
   if (!currentBookingForAssignment) return;
 
   const modal = document.getElementById("assignModal");
 
   try {
+    // Get current booking to check if reassigning
+    const bookingData = currentBookingForAssignment.data;
+
+    // If reassigning (booking already has a partner), clear old partner's flag
+    if (bookingData.partnerId) {
+      const oldPartner = allPartners.find(p => p.partnerId === bookingData.partnerId);
+      if (oldPartner) {
+        await updateDoc(doc(partnersDb, "partners", oldPartner.id), {
+          hasActiveBooking: false,
+          activeBookingId: null
+        });
+        console.log("✓ Cleared old partner's active booking flag");
+      }
+    }
+
+    // Assign new partner to booking
     await updateDoc(doc(db, "bookings", currentBookingForAssignment.id), {
       status: "ASSIGNED",
       assignedAt: new Date().toISOString(),
